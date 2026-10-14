@@ -53,17 +53,13 @@ export declare function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries: nu
  */
 export declare function getAwsAccountId(clients: AWSClients, maxRetries: number, retryDelay: number): Promise<string>;
 /**
- * Check if an application version exists
- */
-export declare function applicationVersionExists(clients: AWSClients, applicationName: string, versionLabel: string): Promise<boolean>;
-/**
  * Get the processing status of an application version (UNPROCESSED, BUILDING while an image builds, PROCESSED, FAILED).
  * Used to poll a Beanstalk Cluster image build to completion.
  */
 export declare function getApplicationVersionStatus(clients: AWSClients, applicationName: string, versionLabel: string, maxRetries?: number, retryDelay?: number): Promise<string | undefined>;
 /**
  * Describe an application version: the single DescribeApplicationVersions call behind
- * applicationVersionExists and getApplicationVersionStatus.
+ * getApplicationVersionStatus and the label lookup in main.
  */
 export declare function getApplicationVersionInfo(clients: AWSClients, applicationName: string, versionLabel: string, maxRetries?: number, retryDelay?: number): Promise<{
     exists: boolean;

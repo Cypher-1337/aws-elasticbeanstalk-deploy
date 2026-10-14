@@ -110598,7 +110598,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.describeEvents = exports.describeEnvironment = exports.createEnvironment = exports.updateEnvironment = exports.createApplicationVersion = exports.createS3Bucket = exports.uploadToS3 = exports.environmentExists = exports.getVersionS3Location = exports.getApplicationVersionImageUri = exports.getApplicationVersionInfo = exports.getApplicationVersionStatus = exports.applicationVersionExists = exports.getAwsAccountId = exports.retryWithBackoff = exports.isNonRetryableError = exports.AWS_S3_REGIONS = exports.validateOptionSettingsForCreateClusterMode = exports.validateOptionSettingsForCreate = exports.IAM_ROLE_ARN_PATTERN = exports.DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES = exports.unknownImageBuildConfigurationFields = exports.MAX_DEPLOYMENT_PACKAGE_SIZE_BYTES = void 0;
+exports.describeEvents = exports.describeEnvironment = exports.createEnvironment = exports.updateEnvironment = exports.createApplicationVersion = exports.createS3Bucket = exports.uploadToS3 = exports.environmentExists = exports.getVersionS3Location = exports.getApplicationVersionImageUri = exports.getApplicationVersionInfo = exports.getApplicationVersionStatus = exports.getAwsAccountId = exports.retryWithBackoff = exports.isNonRetryableError = exports.AWS_S3_REGIONS = exports.validateOptionSettingsForCreateClusterMode = exports.validateOptionSettingsForCreate = exports.IAM_ROLE_ARN_PATTERN = exports.DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES = exports.unknownImageBuildConfigurationFields = exports.MAX_DEPLOYMENT_PACKAGE_SIZE_BYTES = void 0;
 const core = __importStar(__nccwpck_require__(7484));
 const client_elastic_beanstalk_1 = __nccwpck_require__(6114);
 const client_s3_1 = __nccwpck_require__(3711);
@@ -110812,19 +110812,6 @@ async function getAwsAccountId(clients, maxRetries, retryDelay) {
 }
 exports.getAwsAccountId = getAwsAccountId;
 /**
- * Check if an application version exists
- */
-async function applicationVersionExists(clients, applicationName, versionLabel) {
-    try {
-        return (await getApplicationVersionInfo(clients, applicationName, versionLabel)).exists;
-    }
-    catch (error) {
-        core.debug(`Error checking application version ${versionLabel} existence: ${error}`);
-        return false;
-    }
-}
-exports.applicationVersionExists = applicationVersionExists;
-/**
  * Get the processing status of an application version (UNPROCESSED, BUILDING while an image builds, PROCESSED, FAILED).
  * Used to poll a Beanstalk Cluster image build to completion.
  */
@@ -110834,7 +110821,7 @@ async function getApplicationVersionStatus(clients, applicationName, versionLabe
 exports.getApplicationVersionStatus = getApplicationVersionStatus;
 /**
  * Describe an application version: the single DescribeApplicationVersions call behind
- * applicationVersionExists and getApplicationVersionStatus.
+ * getApplicationVersionStatus and the label lookup in main.
  */
 async function getApplicationVersionInfo(clients, applicationName, versionLabel, maxRetries = 0, retryDelay = 1) {
     const command = new client_elastic_beanstalk_1.DescribeApplicationVersionsCommand({
@@ -111566,16 +111553,15 @@ async function run() {
                 }
             }
         }
+        // Labels can't be recreated, and a failed lookup must not read as "free".
+        const existing = await (0, aws_operations_1.getApplicationVersionInfo)(clients, applicationName, applicationVersionLabel, maxRetries, retryDelay);
+        if (existing.exists && !useExistingApplicationVersionIfAvailable) {
+            throw existingLabelError(applicationVersionLabel);
+        }
         if (imageUri) {
             // Beanstalk Cluster BYOI: skip packaging/S3, create the application version from ImageConfiguration.Source.
             // The application is created through AutoCreateApplication on CreateApplicationVersion,
             // exactly like the Beanstalk Standard path.
-            // Same reuse semantics as the Beanstalk Standard path: a version label can't be recreated,
-            // so if one already exists under this label it is deployed as-is — unless its image build
-            // FAILED (undeployable) or is still running (wait for it).
-            const existing = useExistingApplicationVersionIfAvailable
-                ? await (0, aws_operations_1.getApplicationVersionInfo)(clients, applicationName, applicationVersionLabel, maxRetries, retryDelay)
-                : { exists: false };
             if (existing.exists) {
                 core.startGroup('♻️  Reusing existing version');
                 await ensureReusableClusterVersion(clients, applicationName, applicationVersionLabel, existing.status, existing.buildTimeoutMinutes ?? aws_operations_1.DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES, maskIdentifiers);
@@ -111610,12 +111596,6 @@ async function run() {
             const buildTimeoutMinutes = Number.isFinite(requestedTimeout) && requestedTimeout > 0
                 ? requestedTimeout
                 : aws_operations_1.DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES;
-            // Same reuse semantics as the Beanstalk Standard path: a version label can't be recreated,
-            // so if one already exists under this label it is deployed as-is (no packaging, upload, or
-            // build) — unless its build FAILED (undeployable) or is still running (wait for it).
-            const existing = useExistingApplicationVersionIfAvailable
-                ? await (0, aws_operations_1.getApplicationVersionInfo)(clients, applicationName, applicationVersionLabel, maxRetries, retryDelay)
-                : { exists: false };
             if (existing.exists) {
                 core.startGroup('♻️  Reusing existing version');
                 await ensureReusableClusterVersion(clients, applicationName, applicationVersionLabel, existing.status, existing.buildTimeoutMinutes ?? buildTimeoutMinutes, maskIdentifiers);
@@ -111645,14 +111625,12 @@ async function run() {
             }
         }
         else {
-            // Classic EB: package → S3 → CreateApplicationVersion
-            core.startGroup('📦 Creating deployment package');
-            const { path: packagePath } = await (0, deploymentpackage_1.createDeploymentPackage)(deploymentPackagePath, applicationVersionLabel, excludePatterns, sourceDirectory, symlinks);
-            core.endGroup();
             let bucket;
             let key;
-            const shouldCreateNewApplicationVersion = !useExistingApplicationVersionIfAvailable || !(await (0, aws_operations_1.applicationVersionExists)(clients, applicationName, applicationVersionLabel));
-            if (shouldCreateNewApplicationVersion) {
+            if (!existing.exists) {
+                core.startGroup('📦 Creating deployment package');
+                const { path: packagePath } = await (0, deploymentpackage_1.createDeploymentPackage)(deploymentPackagePath, applicationVersionLabel, excludePatterns, sourceDirectory, symlinks);
+                core.endGroup();
                 core.startGroup('☁️  Uploading to S3');
                 const uploadResult = await (0, aws_operations_1.uploadToS3)(clients, awsRegion, accountId, applicationName, applicationVersionLabel, packagePath, maxRetries, retryDelay, createS3BucketIfNotExists, s3BucketName);
                 bucket = uploadResult.bucket;
@@ -111805,6 +111783,11 @@ async function ensureReusableClusterVersion(clients, applicationName, versionLab
         core.info(`Version ${versionLabel} already exists and its image build is still ${status}; waiting for it to finish`);
         await waitForImageBuild(clients, applicationName, versionLabel, buildTimeoutMinutes, maskIdentifiers);
     }
+}
+function existingLabelError(versionLabel) {
+    return new Error(`Application version '${versionLabel}' already exists and use-existing-application-version-if-available is false. ` +
+        'Re-run with a new version-label, delete the existing version, or set ' +
+        'use-existing-application-version-if-available to true to deploy the existing version as-is.');
 }
 /**
  * Confirm a Beanstalk Cluster application version actually carries an image before deploying it,
