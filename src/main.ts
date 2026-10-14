@@ -5,7 +5,6 @@ import { AWSClients } from './aws-clients';
 import { createDeploymentPackage } from './deploymentpackage';
 import {
   getAwsAccountId,
-  applicationVersionExists,
   getApplicationVersionStatus,
   getApplicationVersionInfo,
   getVersionS3Location,
@@ -169,16 +168,16 @@ export async function run(): Promise<void> {
       }
     }
 
+    // Labels can't be recreated, and a failed lookup must not read as "free".
+    const existing = await getApplicationVersionInfo(clients, applicationName, applicationVersionLabel, maxRetries, retryDelay);
+    if (existing.exists && !useExistingApplicationVersionIfAvailable) {
+      throw existingLabelError(applicationVersionLabel);
+    }
+
     if (imageUri) {
       // Beanstalk Cluster BYOI: skip packaging/S3, create the application version from ImageConfiguration.Source.
       // The application is created through AutoCreateApplication on CreateApplicationVersion,
       // exactly like the Beanstalk Standard path.
-      // Same reuse semantics as the Beanstalk Standard path: a version label can't be recreated,
-      // so if one already exists under this label it is deployed as-is — unless its image build
-      // FAILED (undeployable) or is still running (wait for it).
-      const existing = useExistingApplicationVersionIfAvailable
-        ? await getApplicationVersionInfo(clients, applicationName, applicationVersionLabel, maxRetries, retryDelay)
-        : { exists: false };
       if (existing.exists) {
         core.startGroup('♻️  Reusing existing version');
         await ensureReusableClusterVersion(clients, applicationName, applicationVersionLabel, existing.status, existing.buildTimeoutMinutes ?? DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES, maskIdentifiers);
@@ -216,13 +215,6 @@ export async function run(): Promise<void> {
       const buildTimeoutMinutes = Number.isFinite(requestedTimeout) && requestedTimeout > 0
         ? requestedTimeout
         : DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES;
-
-      // Same reuse semantics as the Beanstalk Standard path: a version label can't be recreated,
-      // so if one already exists under this label it is deployed as-is (no packaging, upload, or
-      // build) — unless its build FAILED (undeployable) or is still running (wait for it).
-      const existing = useExistingApplicationVersionIfAvailable
-        ? await getApplicationVersionInfo(clients, applicationName, applicationVersionLabel, maxRetries, retryDelay)
-        : { exists: false };
 
       if (existing.exists) {
         core.startGroup('♻️  Reusing existing version');
@@ -273,22 +265,20 @@ export async function run(): Promise<void> {
         core.endGroup();
       }
     } else {
-      // Classic EB: package → S3 → CreateApplicationVersion
-      core.startGroup('📦 Creating deployment package');
-      const { path: packagePath } = await createDeploymentPackage(
-        deploymentPackagePath,
-        applicationVersionLabel,
-        excludePatterns,
-        sourceDirectory,
-        symlinks
-      );
-      core.endGroup();
-
       let bucket: string;
       let key: string;
-      const shouldCreateNewApplicationVersion = !useExistingApplicationVersionIfAvailable || !(await applicationVersionExists(clients, applicationName, applicationVersionLabel));
 
-      if (shouldCreateNewApplicationVersion) {
+      if (!existing.exists) {
+        core.startGroup('📦 Creating deployment package');
+        const { path: packagePath } = await createDeploymentPackage(
+          deploymentPackagePath,
+          applicationVersionLabel,
+          excludePatterns,
+          sourceDirectory,
+          symlinks
+        );
+        core.endGroup();
+
         core.startGroup('☁️  Uploading to S3');
         const uploadResult = await uploadToS3(
           clients,
@@ -507,6 +497,14 @@ async function ensureReusableClusterVersion(
     core.info(`Version ${versionLabel} already exists and its image build is still ${status}; waiting for it to finish`);
     await waitForImageBuild(clients, applicationName, versionLabel, buildTimeoutMinutes, maskIdentifiers);
   }
+}
+
+function existingLabelError(versionLabel: string): Error {
+  return new Error(
+    `Application version '${versionLabel}' already exists and use-existing-application-version-if-available is false. ` +
+    'Re-run with a new version-label, delete the existing version, or set ' +
+    'use-existing-application-version-if-available to true to deploy the existing version as-is.'
+  );
 }
 
 /**

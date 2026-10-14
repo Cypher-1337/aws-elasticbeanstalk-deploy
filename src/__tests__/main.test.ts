@@ -860,6 +860,7 @@ describe('Main Functions', () => {
       mockSend
         .mockResolvedValueOnce({ Account: '123456789012' }) // GetCallerIdentity
         .mockResolvedValueOnce({ Environments: [{ Status: 'Ready', Health: 'Green', Tier: { Name: 'WebServer' } }] }) // DescribeEnvironments
+        .mockResolvedValueOnce({ ApplicationVersions: [] }) // DescribeApplicationVersions (label free)
         .mockResolvedValueOnce({}) // HeadBucket (bucket exists, owned by us)
         .mockResolvedValueOnce({}) // PutObject
         .mockResolvedValueOnce({}) // CreateAppVersion
@@ -885,6 +886,7 @@ describe('Main Functions', () => {
       mockSend
         .mockResolvedValueOnce({ Account: '123456789012' }) // GetCallerIdentity
         .mockResolvedValueOnce({ Environments: [] }) // DescribeEnvironments (no env found)
+        .mockResolvedValueOnce({ ApplicationVersions: [] }) // DescribeApplicationVersions (label free)
         .mockResolvedValueOnce({}) // HeadBucket (bucket exists, owned by us)
         .mockResolvedValueOnce({}) // PutObject
         .mockResolvedValueOnce({}) // CreateAppVersion
@@ -899,6 +901,62 @@ describe('Main Functions', () => {
       expect(mockedCore.setOutput).toHaveBeenCalledWith('version-label', 'v1.0.0');
     });
 
+    it('fails before packaging or uploading when the label exists and use-existing-application-version-if-available is false', async () => {
+      // getBooleanInput returns false for the reuse input in this suite, matching the action default
+      mockSend
+        .mockResolvedValueOnce({ Account: '123456789012' })
+        .mockResolvedValueOnce({ Environments: [{ Status: 'Ready', Health: 'Green', Tier: { Name: 'WebServer' } }] })
+        .mockResolvedValueOnce({ ApplicationVersions: [{ VersionLabel: 'v1.0.0', SourceBundle: { S3Bucket: 'my-bucket', S3Key: 'my-app/v1.0.0.zip' } }] }); // label taken
+
+      await run();
+
+      expect(mockedCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Application version 'v1.0.0' already exists and use-existing-application-version-if-available is false"));
+      const archiver = require('archiver');
+      expect(archiver).not.toHaveBeenCalled();
+      expect(mockSend).toHaveBeenCalledTimes(3); // no HeadBucket, PutObject, CreateApplicationVersion, or UpdateEnvironment
+      expect(createVersionInputs()).toHaveLength(0);
+    });
+
+    it('creates a new version when use-existing-application-version-if-available is true but the label is free', async () => {
+      mockedCore.getBooleanInput.mockImplementation((name: string) => {
+        if (name === 'create-s3-bucket-if-not-exists') return true;
+        if (name === 'use-existing-application-version-if-available') return true;
+        return false;
+      });
+      mockStandardUpdateFlow();
+
+      await run();
+
+      expect(mockedCore.setFailed).not.toHaveBeenCalled();
+      expect(createVersionInputs()).toHaveLength(1);
+      expect(mockedCore.setOutput).toHaveBeenCalledWith('deployment-action-type', 'update');
+    });
+
+    it('fails the run without packaging when the label lookup itself fails', async () => {
+      // The lookup is retried (max-retries is 3 in this suite) and then fails the run: an
+      // unanswerable "does this label exist" must not be treated as "label free".
+      mockedCore.getInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          'aws-region': 'us-east-1', 'application-name': 'test-app', 'environment-name': 'test-env',
+          'solution-stack-name': '64bit Amazon Linux 2', 'version-label': 'v1.0.0',
+          'deployment-timeout': '900', 'max-retries': '1', 'retry-delay': '1', 'exclude-patterns': '*.git*',
+        };
+        return inputs[name] || '';
+      });
+      mockSend
+        .mockResolvedValueOnce({ Account: '123456789012' })
+        .mockResolvedValueOnce({ Environments: [{ Status: 'Ready', Health: 'Green', Tier: { Name: 'WebServer' } }] })
+        .mockRejectedValueOnce(new Error('Throttling')) // DescribeApplicationVersions attempt 1
+        .mockRejectedValueOnce(new Error('Throttling')); // DescribeApplicationVersions attempt 2 (max-retries 1)
+
+      await run();
+
+      expect(mockedCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('Describe application version failed after 2 attempts'));
+      expect(require('archiver')).not.toHaveBeenCalled();
+      expect(createVersionInputs()).toHaveLength(0);
+      expect(mockSend).toHaveBeenCalledTimes(4); // no HeadBucket/PutObject
+    }, 20000);
+
     it('should reuse existing version when use-existing-application-version-if-available is true', async () => {
       mockedCore.getBooleanInput.mockImplementation((name: string) => {
         if (name === 'create-s3-bucket-if-not-exists') return true;
@@ -906,7 +964,7 @@ describe('Main Functions', () => {
         return false;
       });
 
-      // Mock sequence: STS -> DescribeEnvs -> applicationVersionExists (true) -> getVersionS3Location -> DescribeEnvs (fresh) -> UpdateEnv -> GetEnvInfo
+      // Mock sequence: STS -> DescribeEnvs -> DescribeAppVersions (exists) -> getVersionS3Location -> DescribeEnvs (fresh) -> UpdateEnv -> GetEnvInfo
       // No S3 calls since version already exists
       mockSend
         .mockResolvedValueOnce({ Account: '123456789012' })
@@ -919,15 +977,19 @@ describe('Main Functions', () => {
 
       await run();
 
+      // Nothing is packaged for a reused version: there is no bundle to upload.
+      const archiver = require('archiver');
+      expect(archiver).not.toHaveBeenCalled();
       expect(mockedCore.setOutput).toHaveBeenCalledWith('deployment-action-type', 'update');
       expect(mockedCore.setOutput).toHaveBeenCalledWith('version-label', 'v1.0.0');
     });
 
-    // STS -> DescribeEnvs -> HeadBucket -> PutObject -> CreateAppVersion -> DescribeEnvs (fresh) -> UpdateEnv -> GetEnvInfo
+    // STS -> DescribeEnvs -> DescribeAppVersions (label free) -> HeadBucket -> PutObject -> CreateAppVersion -> DescribeEnvs (fresh) -> UpdateEnv -> GetEnvInfo
     function mockStandardUpdateFlow() {
       mockSend
         .mockResolvedValueOnce({ Account: '123456789012' })
         .mockResolvedValueOnce({ Environments: [{ Status: 'Ready', Health: 'Green', Tier: { Name: 'WebServer' } }] })
+        .mockResolvedValueOnce({ ApplicationVersions: [] }) // DescribeApplicationVersions (label free)
         .mockResolvedValueOnce({}) // HeadBucket
         .mockResolvedValueOnce({}) // PutObject
         .mockResolvedValueOnce({}) // CreateAppVersion
@@ -1061,6 +1123,7 @@ describe('Main Functions', () => {
       mockSend
         .mockResolvedValueOnce({ Account: '123456789012' })
         .mockResolvedValueOnce({ Environments: [{ Status: 'Ready', Health: 'Green', Tier: { Name: 'WebServer' } }] })
+        .mockResolvedValueOnce({ ApplicationVersions: [] }) // DescribeApplicationVersions (label free)
         .mockResolvedValueOnce({}) // HeadBucket
         .mockResolvedValueOnce({}) // PutObject
         .mockResolvedValueOnce({}) // CreateAppVersion
@@ -1307,7 +1370,8 @@ describe('Main Functions', () => {
       useClusterInputs({ 'build-configuration': JSON.stringify(cfg) });
       mockSend
         .mockResolvedValueOnce({ Account: '123456789012' })
-        .mockResolvedValueOnce(clusterEnv);
+        .mockResolvedValueOnce(clusterEnv)
+        .mockResolvedValueOnce({ ApplicationVersions: [] }); // DescribeApplicationVersions (label free)
 
       await run();
 
@@ -1316,7 +1380,7 @@ describe('Main Functions', () => {
       const archiver = require('archiver');
       expect(archiver).not.toHaveBeenCalled();
       expect(createVersionInputs()).toHaveLength(0);
-      expect(mockSend).toHaveBeenCalledTimes(2);
+      expect(mockSend).toHaveBeenCalledTimes(3);
     });
 
     it('should accept a build-configuration that uses only modeled fields', async () => {
@@ -1537,6 +1601,34 @@ describe('Main Functions', () => {
 
       expect(createVersionInputs()).toHaveLength(1);
       expect(mockedCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('Image build failed'));
+    });
+
+    it('should fail before packaging in build-configuration mode when the label exists and reuse is off', async () => {
+      useClusterInputs({ 'build-configuration': BUILD_CONFIG }, false);
+      mockSend
+        .mockResolvedValueOnce({ Account: '123456789012' })
+        .mockResolvedValueOnce(clusterEnv)
+        .mockResolvedValueOnce({ ApplicationVersions: [{ VersionLabel: 'v1.0.0', Status: 'PROCESSED' }] }); // label taken
+
+      await run();
+
+      expect(mockedCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('already exists and use-existing-application-version-if-available is false'));
+      expect(require('archiver')).not.toHaveBeenCalled();
+      expect(mockSend).toHaveBeenCalledTimes(3);
+    });
+
+    it('should fail before creating anything in BYOI mode when the label exists and reuse is off', async () => {
+      useClusterInputs({ 'image-uri': '123456789012.dkr.ecr.us-east-1.amazonaws.com/app:v1' }, false);
+      mockSend
+        .mockResolvedValueOnce({ Account: '123456789012' })
+        .mockResolvedValueOnce(clusterEnv)
+        .mockResolvedValueOnce({ ApplicationVersions: [{ VersionLabel: 'v1.0.0', Status: 'PROCESSED' }] }); // label taken
+
+      await run();
+
+      expect(mockedCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('already exists and use-existing-application-version-if-available is false'));
+      expect(createVersionInputs()).toHaveLength(0);
+      expect(mockSend).toHaveBeenCalledTimes(3);
     });
 
     it('should reuse an existing version in build-configuration mode and skip packaging and the image build', async () => {
