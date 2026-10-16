@@ -110598,7 +110598,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
     return result;
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.describeEvents = exports.describeEnvironment = exports.createEnvironment = exports.updateEnvironment = exports.createApplicationVersion = exports.createS3Bucket = exports.uploadToS3 = exports.environmentExists = exports.getVersionS3Location = exports.getApplicationVersionImageUri = exports.getApplicationVersionInfo = exports.getApplicationVersionStatus = exports.getAwsAccountId = exports.retryWithBackoff = exports.isNonRetryableError = exports.AWS_S3_REGIONS = exports.validateOptionSettingsForCreateClusterMode = exports.validateOptionSettingsForCreate = exports.IAM_ROLE_ARN_PATTERN = exports.DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES = exports.unknownImageBuildConfigurationFields = exports.MAX_DEPLOYMENT_PACKAGE_SIZE_BYTES = void 0;
+exports.describeEvents = exports.describeEnvironment = exports.createEnvironment = exports.updateEnvironment = exports.createApplicationVersion = exports.createS3Bucket = exports.uploadToS3 = exports.environmentExists = exports.getVersionS3Location = exports.getApplicationVersionImageUri = exports.getApplicationVersionInfo = exports.getApplicationVersionStatus = exports.getAwsAccountId = exports.retryWithBackoff = exports.isNonRetryableError = exports.isObjectAlreadyExistsError = exports.AWS_S3_REGIONS = exports.validateOptionSettingsForCreateClusterMode = exports.validateOptionSettingsForCreate = exports.IAM_ROLE_ARN_PATTERN = exports.DEFAULT_IMAGE_BUILD_TIMEOUT_MINUTES = exports.unknownImageBuildConfigurationFields = exports.MAX_DEPLOYMENT_PACKAGE_SIZE_BYTES = void 0;
 const core = __importStar(__nccwpck_require__(7484));
 const client_elastic_beanstalk_1 = __nccwpck_require__(6114);
 const client_s3_1 = __nccwpck_require__(3711);
@@ -110742,6 +110742,11 @@ exports.AWS_S3_REGIONS = [
     'us-west-1',
     'us-west-2',
 ];
+function isObjectAlreadyExistsError(error) {
+    const err = error;
+    return err?.name === 'PreconditionFailed' || err?.$metadata?.httpStatusCode === 412;
+}
+exports.isObjectAlreadyExistsError = isObjectAlreadyExistsError;
 /**
  * Errors that retrying cannot fix: authorization/permission failures, expired or invalid
  * credentials, and deterministic Elastic Beanstalk rejections. Shared by retryWithBackoff and the
@@ -110768,7 +110773,8 @@ function isNonRetryableError(error) {
     // "Application version 'X' does not exist or is not compatible with Kubernetes-based environments ...".
     const isIncompatibleVersionError = err?.name === 'InvalidParameterValueException' &&
         /does not exist or is not compatible with .* environments/i.test(message);
-    return err?.name === 'BucketCheckResult' || isAuthError || isCredentialError || isAppVersionExistsError || isIncompatibleVersionError;
+    const isObjectExistsError = isObjectAlreadyExistsError(err) || /an object already exists at s3:\/\//i.test(message);
+    return err?.name === 'BucketCheckResult' || isAuthError || isCredentialError || isAppVersionExistsError || isIncompatibleVersionError || isObjectExistsError;
 }
 exports.isNonRetryableError = isNonRetryableError;
 /**
@@ -110948,8 +110954,20 @@ async function uploadToS3(clients, region, accountId, applicationName, versionLa
             Key: key,
             Body: fs.createReadStream(packagePath),
             ContentLength: fileSizeBytes,
+            IfNoneMatch: '*',
         });
-        await clients.getS3Client().send(command);
+        try {
+            await clients.getS3Client().send(command);
+        }
+        catch (error) {
+            if (isObjectAlreadyExistsError(error)) {
+                throw new Error(`An object already exists at s3://${bucket}/${key}, so the deployment package was not uploaded. ` +
+                    `Usually an application version with label '${versionLabel}' already exists; it can also be left over ` +
+                    'from an earlier run that uploaded but did not finish creating the version, or from a version deleted ' +
+                    'without its bundle. Re-run with a new version-label, or delete the version with DeleteSourceBundle=true and retry.');
+            }
+            throw error;
+        }
     }, maxRetries, retryDelay, 'Upload to S3');
     core.info('✅ Upload complete');
     return { bucket, key };
@@ -111553,7 +111571,7 @@ async function run() {
                 }
             }
         }
-        // Labels can't be recreated, and a failed lookup must not read as "free".
+        // Advisory; an unauthorized describe returns an empty list, not an error.
         const existing = await (0, aws_operations_1.getApplicationVersionInfo)(clients, applicationName, applicationVersionLabel, maxRetries, retryDelay);
         if (existing.exists && !useExistingApplicationVersionIfAvailable) {
             throw existingLabelError(applicationVersionLabel);
@@ -111777,7 +111795,7 @@ async function ensureReusableClusterVersion(clients, applicationName, versionLab
     const normalized = status?.toUpperCase();
     if (normalized === 'FAILED') {
         throw new Error(`Application version ${versionLabel} already exists but its image build FAILED, so it cannot be deployed, ` +
-            'and a new version cannot be created under an existing label. Use a new version-label (or delete the existing version) and retry.');
+            'and a new version cannot be created under an existing label. Use a new version-label, or delete the existing version with DeleteSourceBundle=true, and retry.');
     }
     if (normalized && normalized !== 'PROCESSED' && normalized !== 'UNPROCESSED') {
         core.info(`Version ${versionLabel} already exists and its image build is still ${status}; waiting for it to finish`);
@@ -111786,7 +111804,7 @@ async function ensureReusableClusterVersion(clients, applicationName, versionLab
 }
 function existingLabelError(versionLabel) {
     return new Error(`Application version '${versionLabel}' already exists and use-existing-application-version-if-available is false. ` +
-        'Re-run with a new version-label, delete the existing version, or set ' +
+        'Re-run with a new version-label, delete the existing version with DeleteSourceBundle=true, or set ' +
         'use-existing-application-version-if-available to true to deploy the existing version as-is.');
 }
 /**
