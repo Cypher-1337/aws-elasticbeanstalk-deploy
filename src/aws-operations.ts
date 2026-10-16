@@ -184,6 +184,11 @@ export const AWS_S3_REGIONS = [
 
 export type AWSS3Region = typeof AWS_S3_REGIONS[number];
 
+export function isObjectAlreadyExistsError(error: unknown): boolean {
+  const err = error as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
+  return err?.name === 'PreconditionFailed' || err?.$metadata?.httpStatusCode === 412;
+}
+
 /**
  * Errors that retrying cannot fix: authorization/permission failures, expired or invalid
  * credentials, and deterministic Elastic Beanstalk rejections. Shared by retryWithBackoff and the
@@ -219,7 +224,9 @@ export function isNonRetryableError(error: unknown): boolean {
     err?.name === 'InvalidParameterValueException' &&
     /does not exist or is not compatible with .* environments/i.test(message);
 
-  return err?.name === 'BucketCheckResult' || isAuthError || isCredentialError || isAppVersionExistsError || isIncompatibleVersionError;
+  const isObjectExistsError = isObjectAlreadyExistsError(err) || /an object already exists at s3:\/\//i.test(message);
+
+  return err?.name === 'BucketCheckResult' || isAuthError || isCredentialError || isAppVersionExistsError || isIncompatibleVersionError || isObjectExistsError;
 }
 
 /**
@@ -482,9 +489,22 @@ export async function uploadToS3(
         Key: key,
         Body: fs.createReadStream(packagePath),
         ContentLength: fileSizeBytes,
+        IfNoneMatch: '*',
       });
 
-      await clients.getS3Client().send(command);
+      try {
+        await clients.getS3Client().send(command);
+      } catch (error) {
+        if (isObjectAlreadyExistsError(error)) {
+          throw new Error(
+            `An object already exists at s3://${bucket}/${key}, so the deployment package was not uploaded. ` +
+            `Usually an application version with label '${versionLabel}' already exists; it can also be left over ` +
+            'from an earlier run that uploaded but did not finish creating the version, or from a version deleted ' +
+            'without its bundle. Re-run with a new version-label, or delete the version with DeleteSourceBundle=true and retry.'
+          );
+        }
+        throw error;
+      }
     },
     maxRetries,
     retryDelay,
